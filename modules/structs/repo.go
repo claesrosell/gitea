@@ -300,6 +300,7 @@ const (
 	OneDevService                          // 6 onedev service
 	GitBucketService                       // 7 gitbucket service
 	CodebaseService                        // 8 codebase service
+	JiraService                            // 9 jira service
 )
 
 // Name represents the service type's name
@@ -327,6 +328,8 @@ func (gt GitServiceType) Title() string {
 		return "Codebase"
 	case PlainGitService:
 		return "Git"
+	case JiraService:
+		return "Jira"
 	}
 	return ""
 }
@@ -382,6 +385,7 @@ var SupportedFullGitService = []GitServiceType{
 	OneDevService,
 	GitBucketService,
 	CodebaseService,
+	JiraService,
 }
 
 // RepoTransfer represents a pending repo transfer

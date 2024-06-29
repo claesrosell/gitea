@@ -36,6 +36,8 @@ func ToGitServiceType(value string) structs.GitServiceType {
 		return structs.OneDevService
 	case "gitbucket":
 		return structs.GitBucketService
+	case "jira":
+		return structs.JiraService
 	default:
 		return structs.PlainGitService
 	}

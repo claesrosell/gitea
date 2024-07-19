@@ -32,9 +32,9 @@ import (
 	"code.gitea.io/gitea/modules/timeutil"
 	"code.gitea.io/gitea/modules/uri"
 	"code.gitea.io/gitea/modules/util"
+	attachment_service "code.gitea.io/gitea/services/attachment"
 	"code.gitea.io/gitea/services/pull"
 	repo_service "code.gitea.io/gitea/services/repository"
-
 	"github.com/google/uuid"
 )
 
@@ -373,6 +373,9 @@ func (g *GiteaLocalUploader) SyncTags() error {
 // CreateIssues creates issues
 func (g *GiteaLocalUploader) CreateIssues(issues ...*base.Issue) error {
 	iss := make([]*issues_model.Issue, 0, len(issues))
+	var migrationIssueMap map[int64]*base.Issue
+	migrationIssueMap = make(map[int64]*base.Issue)
+
 	for _, issue := range issues {
 		var labels []*issues_model.Label
 		for _, label := range issue.Labels {
@@ -438,7 +441,9 @@ func (g *GiteaLocalUploader) CreateIssues(issues ...*base.Issue) error {
 			}
 			is.Reactions = append(is.Reactions, &res)
 		}
+
 		iss = append(iss, &is)
+		migrationIssueMap[is.Index] = issue
 	}
 
 	if len(iss) > 0 {
@@ -448,10 +453,83 @@ func (g *GiteaLocalUploader) CreateIssues(issues ...*base.Issue) error {
 
 		for _, is := range iss {
 			g.issues[is.Index] = is
+
+			// add attachments?
+			// Find the corresponding migration issue,
+			migrationIssue := migrationIssueMap[is.Index]
+			if migrationIssue != nil {
+				for _, attachment := range migrationIssue.Attachments {
+					g.uploadAttachment(attachment, is.ID)
+
+					//					modelAttachment := repo_model.Attachment{
+					//						Name:    attachment.Name,
+					//						RepoID:  g.repo.ID,
+					//						IssueID: is.ID,
+					//					}
+
+					//					attachment_service.UploadAttachment(g.ctx, attachment.DownloadFunc(), setting.Attachment.AllowedTypes, attachment.Size, &modelAttachment)
+				}
+			}
 		}
 	}
 
 	return nil
+}
+
+// Stolen from a Gitea PR
+func (g *GiteaLocalUploader) uploadAttachment(asset *base.Attachment, issueID int64) (*repo_model.Attachment, error) {
+	var downloadCnt, size int64
+	if asset.DownloadCount != nil {
+		downloadCnt = int64(*asset.DownloadCount)
+	}
+	if asset.Size != nil {
+		size = int64(*asset.Size)
+	}
+
+	var attachementUUID string
+	if asset.UUID != "" {
+		attachementUUID = asset.UUID
+	} else {
+		attachementUUID = uuid.New().String()
+	}
+
+	attach := repo_model.Attachment{
+		IssueID:       issueID,
+		RepoID:        g.repo.ID,
+		UUID:          attachementUUID,
+		Name:          asset.Name,
+		DownloadCount: downloadCnt,
+		Size:          size,
+		CreatedUnix:   timeutil.TimeStamp(asset.Created.Unix()),
+	}
+
+	// SECURITY: We cannot check the DownloadURL and DownloadFunc are safe here
+	// ... we must assume that they are safe and simply download the attachment
+	// asset.DownloadURL maybe a local file
+	var rc io.ReadCloser
+	var err error
+	if asset.DownloadFunc != nil {
+		rc, err = asset.DownloadFunc()
+		if err != nil {
+			return nil, err
+		}
+	} else if asset.DownloadURL != nil {
+		rc, err = uri.Open(*asset.DownloadURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if rc == nil {
+		return nil, nil
+	}
+	defer rc.Close()
+	attachment_service.UploadAttachment(g.ctx, rc, setting.Attachment.AllowedTypes, attach.Size, &attach)
+
+	//	_, err = storage.Attachments.Save(attach.RelativePath(), rc, int64(*asset.Size))
+	if err != nil {
+		return nil, err
+	}
+	return &attach, nil
 }
 
 // CreateComments creates comments of issues
@@ -490,6 +568,12 @@ func (g *GiteaLocalUploader) CreateComments(comments ...*base.Comment) error {
 		case issues_model.CommentTypeAssignees:
 			if assigneeID, ok := comment.Meta["AssigneeID"].(int); ok {
 				cm.AssigneeID = int64(assigneeID)
+			} else if assigneeName, ok := comment.Meta["AssigneeName"].(string); ok {
+				existingUser, err := user_model.GetUserByName(g.ctx, assigneeName)
+				if err == nil && existingUser != nil {
+					cm.AssigneeID = existingUser.ID
+				}
+
 			}
 			if comment.Meta["RemovedAssigneeID"] != nil {
 				cm.RemovedAssignee = true
@@ -1019,6 +1103,16 @@ func (g *GiteaLocalUploader) remapExternalUser(source user_model.ExternalUserMig
 		if err != nil {
 			log.Error("GetUserIDByExternalUserID: %v", err)
 			return 0, err
+		}
+
+		if userid == 0 {
+			existingUser, err := user_model.GetUserByName(g.ctx, source.GetExternalName())
+			if err != nil {
+				log.Debug("GetUserByName: %v", err)
+				err = nil
+			} else {
+				userid = existingUser.ID
+			}
 		}
 		g.userMap[source.GetExternalID()] = userid
 	}

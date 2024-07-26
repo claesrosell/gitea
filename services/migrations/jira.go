@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -102,14 +103,18 @@ type JiraDownloader struct {
 	SkipReactions      bool
 	SkipReviews        bool
 	jiraProjectKey     string
-	currentIssueNumber int64
 	userIdMap          map[int]*JiraUser
 	userEmailMap       map[string]*JiraUser
+	epicLabelsMap      map[string]*base.Label // Jira epics to labels map
+	componentLabelsMap map[string]*base.Label // Jira components to labels map
+	issueTypeLabelsMap map[string]*base.Label // Jira issue type to labels map
+	labelLabelsMap     map[string]*base.Label // Jira labels to labels map
 }
 
 type jiraIssueContext struct {
 	BogusField  bool // Not used
 	OriginalKey string
+	fileMapping map[string]string
 }
 
 // String implements Stringer
@@ -152,10 +157,13 @@ func NewJiraDownloader(ctx context.Context, baseURL, userName, password, token, 
 
 	JiraDownloader.repoName = repoName
 	JiraDownloader.repoOwner = repoOwner
-	JiraDownloader.currentIssueNumber = 1
 	JiraDownloader.userIdMap = make(map[int]*JiraUser)
 	JiraDownloader.userEmailMap = make(map[string]*JiraUser)
 	JiraDownloader.jiraProjectKey = jiraExtraOptions.ProjectKey
+	JiraDownloader.epicLabelsMap = make(map[string]*base.Label)
+	JiraDownloader.componentLabelsMap = make(map[string]*base.Label)
+	JiraDownloader.labelLabelsMap = make(map[string]*base.Label)
+	JiraDownloader.issueTypeLabelsMap = make(map[string]*base.Label)
 
 	return &JiraDownloader
 }
@@ -243,6 +251,8 @@ func (d *JiraDownloader) GetLabels() ([]*base.Label, error) {
 		return nil, nil
 	}
 
+	rand.Seed(time.Now().UnixNano())
+
 	// Handling components
 	componentsList := projectInfo["components"].([]interface{})
 	for _, componentEntry := range componentsList {
@@ -253,13 +263,10 @@ func (d *JiraDownloader) GetLabels() ([]*base.Label, error) {
 			description = componentMap["description"].(string)
 		}
 
-		createdLabel := &base.Label{
-			Name:        fmt.Sprintf("Component/%s", componentMap["name"].(string)),
-			Description: description,
-			Color:       "#009999",
-			Exclusive:   true,
+		createdLabel, created := d.getComponentLabel(componentMap["name"].(string), description, true)
+		if created {
+			labels = append(labels, createdLabel)
 		}
-		labels = append(labels, createdLabel)
 	}
 
 	// Handling Issue types
@@ -271,15 +278,84 @@ func (d *JiraDownloader) GetLabels() ([]*base.Label, error) {
 		if issueTypeMap["description"] != nil {
 			description = issueTypeMap["description"].(string)
 		}
-
-		createdLabel := &base.Label{
-			Name:        fmt.Sprintf("IssueType/%s", issueTypeMap["name"].(string)),
-			Description: description,
-			Color:       "#009900",
-			Exclusive:   true,
+		createdLabel, created := d.getIssueTypeLabel(issueTypeMap["name"].(string), description, true)
+		if created {
+			labels = append(labels, createdLabel)
 		}
-		labels = append(labels, createdLabel)
 	}
+
+	// Handling Epics
+	{
+		jiraJql := fmt.Sprintf("project = %s AND issueType = Epic ORDER BY key ASC", d.jiraProjectKey)
+		epicIssuesbody, err := d.callApi(fmt.Sprintf("%srest/api/2/search?jql=%s&startAt=0&maxResults=10000", d.jiraBaseUrl, url.QueryEscape(jiraJql)))
+
+		// Parse JSON into an empty interface
+		var epicResult interface{}
+		err = json.Unmarshal(epicIssuesbody, &epicResult)
+		if err == nil {
+			// Accessing dynamic JSON fields
+			dataMap, ok := epicResult.(map[string]interface{})
+			if ok {
+
+				jiraIssues, jiraIssuesExists := dataMap["issues"].([]interface{})
+				if jiraIssuesExists {
+					for _, jiraIssue := range jiraIssues {
+						jiraIssueMap := jiraIssue.(map[string]interface{})
+						epicIssueFieldsMap := jiraIssueMap["fields"].(map[string]interface{})
+						var epicName string
+						epicNameObj, exists := epicIssueFieldsMap["customfield_10007"]
+
+						if exists && epicNameObj != nil {
+							epicName = epicNameObj.(string)
+						} else {
+							epicName = epicIssueFieldsMap["summary"].(string)
+						}
+
+						createdLabel, created := d.getEpicLabel(jiraIssueMap["key"].(string), epicName, true)
+						if created { // Should always beb true here
+							labels = append(labels, createdLabel)
+						}
+					}
+				}
+
+			}
+
+		}
+
+	}
+
+	// Handling jira labels
+	{
+		jiraJql := fmt.Sprintf("project = %s AND labels is not EMPTY", d.jiraProjectKey)
+		epicIssuesbody, err := d.callApi(fmt.Sprintf("%srest/api/2/search?jql=%s&startAt=0&maxResults=10000", d.jiraBaseUrl, url.QueryEscape(jiraJql)))
+
+		// Parse JSON into an empty interface
+		var epicResult interface{}
+		err = json.Unmarshal(epicIssuesbody, &epicResult)
+		if err == nil {
+			// Accessing dynamic JSON fields
+			dataMap, ok := epicResult.(map[string]interface{})
+			if ok {
+
+				jiraIssues, jiraIssuesExists := dataMap["issues"].([]interface{})
+				if jiraIssuesExists {
+					for _, jiraIssue := range jiraIssues {
+						jiraIssueMap := jiraIssue.(map[string]interface{})
+						jiraIssueFieldsMap := jiraIssueMap["fields"].(map[string]interface{})
+						labelsList := jiraIssueFieldsMap["labels"].([]interface{})
+						for _, labelEntry := range labelsList {
+							labelName := labelEntry.(string)
+							label, created := d.getLabel(labelName, true)
+							if created {
+								labels = append(labels, label)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return labels, nil
 }
 
@@ -306,26 +382,51 @@ func (d *JiraDownloader) GetMilestones() ([]*base.Milestone, error) {
 	for _, versionEntry := range versionsList {
 		versionMap := versionEntry.(map[string]interface{})
 
-		todayStr := time.Now().Local().Format(JiraDateFormat)
-		bool(versionMap["archived"])
-		versionMap["releaseDate"].(string) // Planned date?
-		time.Parse(JiraDateFormat, "")
+		milestoneName := versionMap["name"].(string)
 
-		versionMap["userReleaseDate"].(string) // Actual date?
+		todayStr := time.Now().Local().Format(JiraDateFormat)
+		todayTime, _ := time.Parse(JiraDateFormat, todayStr)
+
+		//		bool(versionMap["archived"])
+
+		var closedTime *time.Time
+		var deadlineTime *time.Time
+
+		releaseDateStr, exists := versionMap["releaseDate"] // Planned date?
+		if exists {
+			if releaseDateStr != nil {
+				localDeadlineTime, err := time.Parse(JiraDateFormat, releaseDateStr.(string))
+				if err == nil {
+					deadlineTime = &localDeadlineTime
+				}
+			}
+		}
+		userReleaseDateStr, exists := versionMap["userReleaseDate"] // Actual date?
+		if exists {
+			if userReleaseDateStr != nil {
+				localClosedTime, err := time.Parse(JiraDateFormat, userReleaseDateStr.(string))
+				if err == nil {
+					closedTime = &localClosedTime
+				}
+			}
+		}
 
 		state := "open"
-		released, err := strconv.ParseBool(versionMap["released"].(string))
-		if err == nil && !released {
-			state = "closed"
+		released, exists := versionMap["released"]
+		if exists {
+			if released.(bool) {
+				state = "closed"
+			}
 		}
 
 		createdMilestone := &base.Milestone{
-			Title:       versionMap["name"].(string),
+			Title:       milestoneName,
 			Description: "",
-			Created:     createdAT,
-			Updated:     updatedAT,
-			Closed:      ms[i].Closed,
+			Created:     todayTime,
+			Updated:     nil,
+			Closed:      closedTime,
 			State:       state,
+			Deadline:    deadlineTime,
 		}
 		milestones = append(milestones, createdMilestone)
 	}
@@ -339,8 +440,13 @@ func (d *JiraDownloader) GetIssues(page, perPage int) ([]*base.Issue, bool, erro
 
 	//	issues := make([]*base.Issue, 0, len(rawIssues))
 	//	allIssues = append(allIssues, convertJiraIssue(issue))
-	jiraJql := "issuekey%20in(AVIX-7259,AVIX-7293)"
-	body, err := d.callApi(fmt.Sprintf("%srest/api/2/search?jql=%s", d.jiraBaseUrl, jiraJql))
+	jiraJql := "issuekey in(CUS-580,AVIX-7259,AVIX-7293,AVIX-7091,AVIX-7301,AVIX-7726)"
+	//jiraJql = "issuekey in(CUS-580)"
+	jiraJql = fmt.Sprintf("project = %s ORDER BY key ASC", d.jiraProjectKey)
+
+	startAt := (page - 1) * perPage
+	maxResults := perPage
+	body, err := d.callApi(fmt.Sprintf("%srest/api/2/search?jql=%s&startAt=%d&maxResults=%d", d.jiraBaseUrl, url.QueryEscape(jiraJql), startAt, maxResults))
 
 	// Parse JSON into an empty interface
 	var result interface{}
@@ -354,20 +460,22 @@ func (d *JiraDownloader) GetIssues(page, perPage int) ([]*base.Issue, bool, erro
 	if !ok {
 		return nil, true, nil
 	}
+	totalNrIssues := int(dataMap["total"].(float64))
+
+	done := (startAt + maxResults) >= totalNrIssues
+	//	done = true // Remove this when done
 
 	jiraIssues, jiraIssuesExists := dataMap["issues"].([]interface{})
 	if jiraIssuesExists {
 		for _, jiraIssue := range jiraIssues {
 			jiraIssueMap := jiraIssue.(map[string]interface{})
 			convertedIssue := d.HandleJiraIssue(jiraIssueMap)
-			convertedIssue.Number = d.currentIssueNumber
-			d.currentIssueNumber = d.currentIssueNumber + 1
 
 			allIssues = append(allIssues, convertedIssue)
 		}
 	}
 
-	return allIssues, true, nil
+	return allIssues, done, nil
 }
 
 func (d *JiraDownloader) callApi(endpoint string) ([]byte, error) {
@@ -392,6 +500,8 @@ func (d *JiraDownloader) callApi(endpoint string) ([]byte, error) {
 func (d *JiraDownloader) HandleJiraIssue(issue map[string]interface{}) *base.Issue {
 	issueKey := issue["key"].(string)
 
+	issueNumber := getIssueNumberFromKey(issueKey)
+
 	issueInfoRequestUrl := fmt.Sprintf("%srest/api/2/issue/%s?expand=changelog", d.jiraBaseUrl, issueKey)
 
 	body, err := d.callApi(issueInfoRequestUrl)
@@ -405,8 +515,14 @@ func (d *JiraDownloader) HandleJiraIssue(issue map[string]interface{}) *base.Iss
 		return nil
 	}
 
+	jiraIssueContentObject := jiraIssueContext{
+		BogusField:  false,
+		OriginalKey: issueKey,
+		fileMapping: make(map[string]string),
+	}
+
 	issueFieldsMap := issue["fields"].(map[string]interface{})
-	title := fmt.Sprintf("%s %s", issue["key"].(string), issueFieldsMap["summary"].(string))
+	title := fmt.Sprintf("%s %s", issueKey, issueFieldsMap["summary"].(string))
 	reporterMap := issueFieldsMap["reporter"].(map[string]interface{})
 	reporterEmail := reporterMap["emailAddress"].(string)
 
@@ -420,15 +536,86 @@ func (d *JiraDownloader) HandleJiraIssue(issue map[string]interface{}) *base.Iss
 		updated = time.Now()
 	}
 
-	description := issueFieldsMap["description"]
-	originalJiraBody := ""
-	if description != nil {
-		originalJiraBody = issueFieldsMap["description"].(string)
+	jiraUser := d.getJiraUserByEmail(reporterEmail)
+
+	// Handle state here
+	state := "open"
+	var closedTime *time.Time
+	resolutionEntry, exists := issueFieldsMap["resolution"]
+	if exists && resolutionEntry != nil {
+		state = "closed"
+		resoultionDateString, exist := issueFieldsMap["resolutiondate"].(string)
+		if exist {
+			localClosedTime, err := time.Parse(JiraTimeFormat, resoultionDateString)
+			if err == nil {
+				closedTime = &localClosedTime
+			}
+		}
 	}
 
-	content := multipleReplace(originalJiraBody, nil, d.jiraProjectKey, "")
+	// Handle fix version / milestone
+	milestone := ""
+	fixVersionList := issueFieldsMap["fixVersions"].([]interface{})
+	for _, fixVersionEntry := range fixVersionList {
+		fixVersionMap := fixVersionEntry.(map[string]interface{})
+		milestone = fixVersionMap["name"].(string)
+		break
+	}
 
-	jiraUser := d.getJiraUserByEmail(reporterEmail)
+	labels := make([]*base.Label, 0, 0)
+
+	// Handle issue type as a label
+	issueTypeMap := issueFieldsMap["issuetype"].(map[string]interface{})
+	issueTypeLabel, _ := d.getIssueTypeLabel(issueTypeMap["name"].(string), "", false)
+	if issueTypeLabel != nil {
+		labels = append(labels, issueTypeLabel)
+	}
+
+	// Handle component as a label
+	componentsList := issueFieldsMap["components"].([]interface{})
+	for _, componentEntry := range componentsList {
+		componentMap := componentEntry.(map[string]interface{})
+		componentLabel, _ := d.getComponentLabel(componentMap["name"].(string), "", false)
+		if componentLabel != nil {
+			labels = append(labels, componentLabel)
+		}
+	}
+
+	// Handle Epic label
+	{
+		epicRefEntry := issueFieldsMap["customfield_10006"]
+		if epicRefEntry != nil {
+			epicRef := epicRefEntry.(string)
+			epicLabel, _ := d.getEpicLabel(epicRef, "", false)
+			if epicLabel != nil { // Should always beb true here
+				labels = append(labels, epicLabel)
+			}
+		}
+	}
+
+	// Handle Jira labels
+	{
+		labelsList := issueFieldsMap["labels"].([]interface{})
+		for _, labelEntry := range labelsList {
+			labelName := labelEntry.(string)
+			label, _ := d.getLabel(labelName, true)
+			if label != nil {
+				labels = append(labels, label)
+			}
+		}
+	}
+
+	// Handle assignee
+	assignees := make([]string, 0, 0)
+	assigneeEntry := issueFieldsMap["assignee"]
+	if assigneeEntry != nil {
+		assigneeMap := assigneeEntry.(map[string]interface{})
+		assigneeEmail := assigneeMap["emailAddress"].(string)
+		assigneeJiraUser := d.getJiraUserByEmail(assigneeEmail)
+		if assigneeJiraUser != nil {
+			assignees = append(assignees, assigneeJiraUser.name)
+		}
+	}
 
 	// Handle attachments
 	attachmentList := issueFieldsMap["attachment"].([]interface{})
@@ -469,11 +656,80 @@ func (d *JiraDownloader) HandleJiraIssue(issue map[string]interface{}) *base.Iss
 					return resp.Body, nil
 				},
 			}
+			jiraIssueContentObject.fileMapping[attachmentName] = attachmentUUID
 			resultingAttachments = append(resultingAttachments, attachmentObj)
 		}
 	}
 
+	// Handle watchers
+	watchers := make([]string, 0, 0)
+	watchersUrl := fmt.Sprintf("%srest/api/2/issue/%s/watchers", d.jiraBaseUrl, issueKey)
+	watchersResultBody, err := d.callApi(watchersUrl)
+	if watchersResultBody != nil && err == nil {
+		// Parse JSON into an empty interface
+		var watchersResult interface{}
+		err = json.Unmarshal(watchersResultBody, &watchersResult)
+		if err == nil {
+			// Accessing dynamic JSON fields
+			watchersForIssue, ok := watchersResult.(map[string]interface{})
+			if ok {
+				watchersList := watchersForIssue["watchers"].([]interface{})
+				for _, watcherEntry := range watchersList {
+					watcherMap := watcherEntry.(map[string]interface{})
+					watcherEmail := watcherMap["emailAddress"].(string)
+
+					watchingJiraUser := d.getJiraUserByEmail(watcherEmail)
+					if watchingJiraUser != nil {
+						watchers = append(watchers, watchingJiraUser.name)
+					}
+				}
+			}
+		}
+	}
+
+	// Handle the description / issue content
+	description := issueFieldsMap["description"]
+	originalJiraBody := ""
+	if description != nil {
+		originalJiraBody = issueFieldsMap["description"].(string)
+	}
+
+	content := multipleReplace(originalJiraBody, jiraIssueContentObject.fileMapping, d.jiraProjectKey, "")
+
+	// Here we should add the sub-task if any exists
+	subTasksList, exists := issueFieldsMap["subtasks"].([]interface{})
+	if exists {
+
+		subTasksContentString := ""
+
+		if len(subTasksList) > 0 {
+			var subTasksToDoBuilder strings.Builder
+			subTasksToDoBuilder.WriteString("#### Sub-Tasks\n")
+
+			for _, subTaskEntry := range subTasksList {
+				subTaskMap := subTaskEntry.(map[string]interface{})
+				subTaskKey := subTaskMap["key"].(string)
+				subTaskNumber := getIssueNumberFromKey(subTaskKey)
+				subTaskFieldsMap := subTaskMap["fields"].(map[string]interface{})
+				subTaskSummary := subTaskFieldsMap["summary"].(string)
+				subTaskStatusMap := subTaskFieldsMap["status"].(map[string]interface{})
+				subTaskStatusCategoryMap := subTaskStatusMap["statusCategory"].(map[string]interface{})
+				subTaskStatusCategoryName := subTaskStatusCategoryMap["name"].(string) // "Done" when done
+
+				if subTaskStatusCategoryName == "Done" {
+					subTasksToDoBuilder.WriteString(fmt.Sprintf("- [x] #%d %s\n", subTaskNumber, subTaskSummary))
+				} else {
+					subTasksToDoBuilder.WriteString(fmt.Sprintf("- [ ] #%d %s\n", subTaskNumber, subTaskSummary))
+				}
+			}
+			subTasksContentString = subTasksToDoBuilder.String()
+		}
+
+		content = fmt.Sprintf("%s\n%s", content, subTasksContentString)
+	}
+
 	return &base.Issue{
+		Number:      issueNumber,
 		Title:       title,
 		Content:     content,
 		PosterID:    int64(jiraUser.userNumber),
@@ -481,8 +737,15 @@ func (d *JiraDownloader) HandleJiraIssue(issue map[string]interface{}) *base.Iss
 		PosterName:  jiraUser.name,
 		Created:     created,
 		Updated:     updated,
-		Context:     jiraIssueContext{BogusField: false, OriginalKey: issue["key"].(string)},
+		Milestone:   milestone,
+		Assignees:   assignees,
+		Labels:      labels,
+		Context:     jiraIssueContentObject,
 		Attachments: resultingAttachments,
+		State:       state,
+		Closed:      closedTime,
+		Watchers:    watchers,
+
 		/*		Number:       issue.Index,
 				PosterID:     issue.Poster.ID,
 				PosterName:   issue.Poster.Login,
@@ -565,7 +828,7 @@ func (d *JiraDownloader) GetComments(commentable base.Commentable) ([]*base.Comm
 	if commentsEntriesExists {
 		for _, commentEntry := range commentsEntries {
 			commentMap := commentEntry.(map[string]interface{})
-			giteaComment := d.convertJiraCommentEntry(commentMap)
+			giteaComment := d.convertJiraCommentEntry(commentMap, context.fileMapping)
 			if giteaComment != nil {
 				giteaComment.IssueIndex = commentable.GetLocalIndex()
 				comments = append(comments, giteaComment)
@@ -576,14 +839,14 @@ func (d *JiraDownloader) GetComments(commentable base.Commentable) ([]*base.Comm
 	return comments, true, nil
 }
 
-func (d *JiraDownloader) convertJiraCommentEntry(commentEntryMap map[string]interface{}) *base.Comment {
+func (d *JiraDownloader) convertJiraCommentEntry(commentEntryMap map[string]interface{}, fileMappings map[string]string) *base.Comment {
 	commentBody := commentEntryMap["body"].(string)
 	authorMap := commentEntryMap["author"].(map[string]interface{})
 	created, err := time.Parse(JiraTimeFormat, commentEntryMap["created"].(string))
 	if err != nil {
 		created = time.Now()
 	}
-	commentContent := multipleReplace(commentBody, nil, "CUS", "")
+	commentContent := multipleReplace(commentBody, fileMappings, d.jiraProjectKey, "")
 	jiraUser := d.getJiraUserByEmail(authorMap["emailAddress"].(string))
 	comment := &base.Comment{
 		PosterID:    int64(jiraUser.userNumber),
@@ -692,6 +955,38 @@ func (d *JiraDownloader) convertJiraChangelogEntry(historyEntryMap map[string]in
 					}
 					comments = append(comments, comment)
 				}
+			} else if changedField == "Link" {
+				jiraUser := d.getJiraUserByEmail(authorMap["emailAddress"].(string))
+
+				if itemMap["to"] != nil {
+					// We should be able to handle "blocked" links here as well
+					// 	"add_dependency", "remove_dependency" - comment types
+					referredIssue := itemMap["to"].(string)
+					toString := itemMap["toString"].(string)
+					//					if strings.HasPrefix(toString, "This issue is duplicated by") { // "toString": "This issue is duplicated by AVIX-4799"
+					// create an IssueRef comment instead. That is nice
+					// claes.rosell/scania#7293
+					//					} else {
+					// "toString": "This issue duplicates AVIX-4788"
+
+					// "toString": "This issue relates to AVIX-4788"
+					// "toString": "This issue relates to AVIX-5805"
+					issueNr := getIssueNumberFromKey(referredIssue)
+					replaceWith := fmt.Sprintf("#%d", issueNr)
+					commentContent := regexp.MustCompile(referredIssue).ReplaceAllString(toString, replaceWith)
+
+					comment := &base.Comment{
+						PosterID:    int64(jiraUser.userNumber),
+						PosterName:  jiraUser.name,
+						PosterEmail: jiraUser.email,
+						Content:     commentContent,
+						Created:     created,
+						Updated:     created,
+					}
+					comments = append(comments, comment)
+					//				}
+				}
+
 			}
 		}
 
@@ -704,7 +999,83 @@ func (d *JiraDownloader) getJiraUserByEmail(userEmail string) *JiraUser {
 	return d.userEmailMap[userEmail]
 }
 
-func multipleReplace(text string, adict map[string]string, jiraProject string, jiraUrl string) string {
+func (downloader *JiraDownloader) getComponentLabel(componentLabelName string, componentDescription string, create bool) (*base.Label, bool) {
+	componentLabel, exists := downloader.componentLabelsMap[componentLabelName]
+	if !exists && create {
+		color := generateRandomColor(&[3]int{255, 255, 255})
+		componentLabel = &base.Label{
+			Name:        fmt.Sprintf("Component/%s", componentLabelName),
+			Description: componentDescription,
+			Color:       color,
+			Exclusive:   true,
+		}
+		downloader.componentLabelsMap[componentLabelName] = componentLabel
+		return componentLabel, true
+	} else if !exists {
+		return nil, false
+	} else {
+		return componentLabel, false
+	}
+}
+
+func (downloader *JiraDownloader) getIssueTypeLabel(issueTypeLabelName string, issueTypeDescription string, create bool) (*base.Label, bool) {
+	componentLabel, exists := downloader.issueTypeLabelsMap[issueTypeLabelName]
+	if !exists && create {
+		color := generateRandomColor(&[3]int{255, 255, 255})
+		componentLabel = &base.Label{
+			Name:        fmt.Sprintf("IssueType/%s", issueTypeLabelName),
+			Description: issueTypeDescription,
+			Color:       color,
+			Exclusive:   true,
+		}
+		downloader.issueTypeLabelsMap[issueTypeLabelName] = componentLabel
+		return componentLabel, true
+	} else if !exists {
+		return nil, false
+	} else {
+		return componentLabel, false
+	}
+}
+
+func (downloader *JiraDownloader) getEpicLabel(epicIssueKey string, epicName string, create bool) (*base.Label, bool) {
+	epicLabel, exists := downloader.epicLabelsMap[epicIssueKey]
+	if !exists && create {
+		color := generateRandomColor(&[3]int{255, 255, 255})
+		epicLabel = &base.Label{
+			Name:        fmt.Sprintf("Epic/%s", epicName),
+			Description: epicIssueKey,
+			Color:       color,
+			Exclusive:   true,
+		}
+		downloader.epicLabelsMap[epicIssueKey] = epicLabel
+		return epicLabel, true
+	} else if !exists {
+		return nil, false
+	} else {
+		return epicLabel, false
+	}
+}
+
+func (downloader *JiraDownloader) getLabel(labelName string, create bool) (*base.Label, bool) {
+	label, exists := downloader.labelLabelsMap[labelName]
+	if !exists && create {
+		color := generateRandomColor(&[3]int{255, 255, 255})
+		label = &base.Label{
+			Name:        labelName,
+			Description: "",
+			Color:       color,
+			Exclusive:   true,
+		}
+		downloader.labelLabelsMap[labelName] = label
+		return label, true
+	} else if !exists {
+		return nil, false
+	} else {
+		return label, false
+	}
+}
+
+func multipleReplace(text string, fileMappings map[string]string, jiraProject string, jiraUrl string) string {
 	if text == "" {
 		return ""
 	}
@@ -730,8 +1101,18 @@ func multipleReplace(text string, adict map[string]string, jiraProject string, j
 	t = regexp.MustCompile(`\n *[\*\-\#]{2}[\*\-] `).ReplaceAllString(t, "\n     - ")
 
 	// Text effects
-	t = regexp.MustCompile(`(^|[\W])\*(\S.*\S)\*([\W]|$)`).ReplaceAllString(t, "$1**$2**$3") // Bold
-	t = regexp.MustCompile(`(^|[\W])_(\S.*\S)_([\W]|$)`).ReplaceAllString(t, "$1*$2*$3")
+	// t = regexp.MustCompile(`(^|[\W])\*(\S.*\S)\*([\W]|$)`).ReplaceAllString(t, "$1**$2**$3") // Bold
+
+	// Bold
+	t = regexp.MustCompile(`\*(.*?)\*`).ReplaceAllStringFunc(t, func(match string) string {
+		return "**" + match[1:len(match)-1] + "**"
+	})
+
+	// Italix
+	t = regexp.MustCompile(`_(.*?)_`).ReplaceAllStringFunc(t, func(match string) string {
+		return "*" + match[1:len(match)-1] + "*"
+	})
+
 	// Deleted / Strikethrough
 	t = regexp.MustCompile(`(^|[\W])-(\S.*\S)-([\W]|$)`).ReplaceAllString(t, "$1~~$2~~$3")
 	t = regexp.MustCompile(`(^|[\W])\+(\S.*\S)\+([\W]|$)`).ReplaceAllString(t, "$1__$2__$3")
@@ -762,10 +1143,36 @@ func multipleReplace(text string, adict map[string]string, jiraProject string, j
 	t = regexp.MustCompile(`\(\*[rgby]?\)`).ReplaceAllString(t, ":star:")
 
 	// Add image handling here
-
-	for k, v := range adict {
-		t = regexp.MustCompile(k).ReplaceAllString(t, v)
+	for filename, uuid := range fileMappings {
+		re := regexp.MustCompile(fmt.Sprintf(`!%s(\|[^!]*)?!`, regexp.QuoteMeta(filename)))
+		t = re.ReplaceAllString(t, fmt.Sprintf("![%s](%s)", filename, "/attachments/"+uuid))
 	}
 
 	return t
+}
+
+func generateRandomColor(mix *[3]int) string {
+
+	red := rand.Intn(256)
+	green := rand.Intn(256)
+	blue := rand.Intn(256)
+
+	// Mix the color
+	if mix != nil {
+		red = (red + mix[0]) / 2
+		green = (green + mix[1]) / 2
+		blue = (blue + mix[2]) / 2
+	}
+
+	return fmt.Sprintf("#%02X%02X%02X", red, green, blue)
+}
+
+func getIssueNumberFromKey(issueKey string) int64 {
+	issueKeyComponents := strings.Split(issueKey, "-")
+	var issueNumber int64
+	if len(issueKeyComponents) > 1 {
+		_, issueNumberAsString := issueKeyComponents[0], issueKeyComponents[1]
+		issueNumber, _ = strconv.ParseInt((issueNumberAsString), 10, 32)
+	}
+	return issueNumber
 }

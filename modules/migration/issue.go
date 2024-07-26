@@ -27,6 +27,7 @@ type Issue struct {
 	ForeignIndex int64             `json:"foreign_id"`
 	Context      DownloaderContext `yaml:"-"`
 	Attachments  []*Attachment     `json:"attachments"`
+	Watchers     []string          `json:"watchers"`
 }
 
 // GetExternalName ExternalUserMigrated interface

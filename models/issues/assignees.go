@@ -143,6 +143,11 @@ func toggleIssueAssignee(ctx context.Context, issue *Issue, doer *user_model.Use
 }
 
 // toggles user assignee state in database
+func PublicToggleUserAssignee(ctx context.Context, issue *Issue, assigneeID int64) (removed bool, err error) {
+	return toggleUserAssignee(ctx, issue, assigneeID)
+}
+
+// toggles user assignee state in database
 func toggleUserAssignee(ctx context.Context, issue *Issue, assigneeID int64) (removed bool, err error) {
 	// Check if the user exists
 	assignee, err := user_model.GetUserByID(ctx, assigneeID)

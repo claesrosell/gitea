@@ -25,7 +25,9 @@ func NewAttachment(ctx context.Context, attach *repo_model.Attachment, file io.R
 	}
 
 	err := db.WithTx(ctx, func(ctx context.Context) error {
-		attach.UUID = uuid.New().String()
+		if attach.UUID == "" {
+			attach.UUID = uuid.New().String()
+		}
 		size, err := storage.Attachments.Save(attach.RelativePath(), file, size)
 		if err != nil {
 			return fmt.Errorf("Create: %w", err)

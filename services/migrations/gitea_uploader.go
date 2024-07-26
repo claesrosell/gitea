@@ -453,21 +453,30 @@ func (g *GiteaLocalUploader) CreateIssues(issues ...*base.Issue) error {
 
 		for _, is := range iss {
 			g.issues[is.Index] = is
+			migrationIssue := migrationIssueMap[is.Index]
+			// Handle assignees
+
+			for _, migrationAssignee := range migrationIssue.Assignees {
+				existingUser, err := user_model.GetUserByName(g.ctx, migrationAssignee)
+				if err == nil && existingUser != nil {
+					issues_model.PublicToggleUserAssignee(g.ctx, is, existingUser.ID)
+				}
+			}
 
 			// add attachments?
 			// Find the corresponding migration issue,
-			migrationIssue := migrationIssueMap[is.Index]
+
 			if migrationIssue != nil {
 				for _, attachment := range migrationIssue.Attachments {
 					g.uploadAttachment(attachment, is.ID)
+				}
+			}
 
-					//					modelAttachment := repo_model.Attachment{
-					//						Name:    attachment.Name,
-					//						RepoID:  g.repo.ID,
-					//						IssueID: is.ID,
-					//					}
-
-					//					attachment_service.UploadAttachment(g.ctx, attachment.DownloadFunc(), setting.Attachment.AllowedTypes, attachment.Size, &modelAttachment)
+			// Set watchers, last
+			for _, watcherName := range migrationIssue.Watchers {
+				existingUser, err := user_model.GetUserByName(g.ctx, watcherName)
+				if err == nil && existingUser != nil {
+					issues_model.CreateOrUpdateIssueWatch(g.ctx, existingUser.ID, is.ID, true)
 				}
 			}
 		}

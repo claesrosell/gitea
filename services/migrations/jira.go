@@ -440,9 +440,9 @@ func (d *JiraDownloader) GetIssues(page, perPage int) ([]*base.Issue, bool, erro
 
 	//	issues := make([]*base.Issue, 0, len(rawIssues))
 	//	allIssues = append(allIssues, convertJiraIssue(issue))
-	jiraJql := "issuekey in(CUS-580,AVIX-7259,AVIX-7293,AVIX-7091,AVIX-7301,AVIX-7726)"
+	//jiraJql := "issuekey in(CUS-580,AVIX-7259,AVIX-7293,AVIX-7091,AVIX-7301,AVIX-7726)"
 	//jiraJql = "issuekey in(CUS-580)"
-	jiraJql = fmt.Sprintf("project = %s ORDER BY key ASC", d.jiraProjectKey)
+	jiraJql := fmt.Sprintf("project = %s ORDER BY key ASC", d.jiraProjectKey)
 
 	startAt := (page - 1) * perPage
 	maxResults := perPage

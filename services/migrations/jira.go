@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"code.gitea.io/gitea/modules/log"
 	base "code.gitea.io/gitea/modules/migration"
@@ -89,26 +90,27 @@ func (f *JiraDownloaderFactory) GitServiceType() structs.GitServiceType {
 // from Jira via GithubDownloader
 type JiraDownloader struct {
 	base.NullDownloader
-	ctx                context.Context
-	bitbucketClient    *http.Client
-	jiraClient         *http.Client
-	bitbucketBaseUrl   string
-	jiraBaseUrl        string
-	repoOwner          string
-	repoName           string
-	userName           string
-	password           string
-	curClientIdx       int
-	maxPerPage         int
-	SkipReactions      bool
-	SkipReviews        bool
-	jiraProjectKey     string
-	userIdMap          map[int]*JiraUser
-	userEmailMap       map[string]*JiraUser
-	epicLabelsMap      map[string]*base.Label // Jira epics to labels map
-	componentLabelsMap map[string]*base.Label // Jira components to labels map
-	issueTypeLabelsMap map[string]*base.Label // Jira issue type to labels map
-	labelLabelsMap     map[string]*base.Label // Jira labels to labels map
+	ctx                  context.Context
+	bitbucketClient      *http.Client
+	jiraClient           *http.Client
+	bitbucketBaseUrl     string
+	jiraBaseUrl          string
+	repoOwner            string
+	repoName             string
+	userName             string
+	password             string
+	curClientIdx         int
+	maxPerPage           int
+	SkipReactions        bool
+	SkipReviews          bool
+	jiraProjectKey       string
+	userIdMap            map[int]*JiraUser
+	userEmailMap         map[string]*JiraUser
+	epicLabelsMap        map[string]*base.Label // Jira epics to labels map
+	componentLabelsMap   map[string]*base.Label // Jira components to labels map
+	issueTypeLabelsMap   map[string]*base.Label // Jira issue type to labels map
+	issueStatusLabelsMap map[string]*base.Label // Jira issue status to labels map
+	labelLabelsMap       map[string]*base.Label // Jira labels to labels map
 }
 
 type jiraIssueContext struct {
@@ -164,6 +166,7 @@ func NewJiraDownloader(ctx context.Context, baseURL, userName, password, token, 
 	JiraDownloader.componentLabelsMap = make(map[string]*base.Label)
 	JiraDownloader.labelLabelsMap = make(map[string]*base.Label)
 	JiraDownloader.issueTypeLabelsMap = make(map[string]*base.Label)
+	JiraDownloader.issueStatusLabelsMap = make(map[string]*base.Label)
 
 	return &JiraDownloader
 }
@@ -284,6 +287,41 @@ func (d *JiraDownloader) GetLabels() ([]*base.Label, error) {
 		}
 	}
 
+	// Handling Issue status
+	{
+		statusesBody, err := d.callApi(fmt.Sprintf("%srest/api/2/project/%s/statuses", d.jiraBaseUrl, d.jiraProjectKey))
+		// Parse JSON into an empty interface
+		var statusesResult interface{}
+		err = json.Unmarshal(statusesBody, &statusesResult)
+		if err != nil {
+			return nil, nil
+		}
+
+		// Accessing dynamic JSON fields
+		issueTypeList, ok := statusesResult.([]interface{})
+		if ok {
+			for _, issueTypeEntry := range issueTypeList {
+				issueTypeMap := issueTypeEntry.(map[string]interface{})
+				statusesForIssueTypeList := issueTypeMap["statuses"].([]interface{})
+				if statusesForIssueTypeList != nil {
+					for _, statusEntry := range statusesForIssueTypeList {
+						statusMap := statusEntry.(map[string]interface{})
+						description := ""
+						if statusMap["description"] != nil {
+							description = statusMap["description"].(string)
+						}
+
+						createdLabel, created := d.getIssueStatusLabel(statusMap["name"].(string), description, true)
+						if created {
+							labels = append(labels, createdLabel)
+						}
+					}
+				}
+			}
+
+		}
+	}
+
 	// Handling Epics
 	{
 		jiraJql := fmt.Sprintf("project = %s AND issueType = Epic ORDER BY key ASC", d.jiraProjectKey)
@@ -317,11 +355,8 @@ func (d *JiraDownloader) GetLabels() ([]*base.Label, error) {
 						}
 					}
 				}
-
 			}
-
 		}
-
 	}
 
 	// Handling jira labels
@@ -438,10 +473,10 @@ func (d *JiraDownloader) GetMilestones() ([]*base.Milestone, error) {
 func (d *JiraDownloader) GetIssues(page, perPage int) ([]*base.Issue, bool, error) {
 	allIssues := make([]*base.Issue, 0, 10)
 
-	//	issues := make([]*base.Issue, 0, len(rawIssues))
-	//	allIssues = append(allIssues, convertJiraIssue(issue))
-	//jiraJql := "issuekey in(CUS-580,AVIX-7259,AVIX-7293,AVIX-7091,AVIX-7301,AVIX-7726)"
-	//jiraJql = "issuekey in(CUS-580)"
+	// issues := make([]*base.Issue, 0, len(rawIssues))
+	// allIssues = append(allIssues, convertJiraIssue(issue))
+	// jiraJql := "issuekey in(CUS-580,AVIX-7259,AVIX-7293,AVIX-7091,AVIX-7301,AVIX-7726,AVIX-6729)"
+	// jiraJql = "issuekey in(CUS-580)"
 	jiraJql := fmt.Sprintf("project = %s ORDER BY key ASC", d.jiraProjectKey)
 
 	startAt := (page - 1) * perPage
@@ -522,7 +557,7 @@ func (d *JiraDownloader) HandleJiraIssue(issue map[string]interface{}) *base.Iss
 	}
 
 	issueFieldsMap := issue["fields"].(map[string]interface{})
-	title := fmt.Sprintf("%s %s", issueKey, issueFieldsMap["summary"].(string))
+	title := issueFieldsMap["summary"].(string)
 	reporterMap := issueFieldsMap["reporter"].(map[string]interface{})
 	reporterEmail := reporterMap["emailAddress"].(string)
 
@@ -579,6 +614,13 @@ func (d *JiraDownloader) HandleJiraIssue(issue map[string]interface{}) *base.Iss
 		if componentLabel != nil {
 			labels = append(labels, componentLabel)
 		}
+	}
+
+	// Handle issue status as label
+	issueStatusMap := issueFieldsMap["status"].(map[string]interface{})
+	issueStatusLabel, _ := d.getIssueStatusLabel(issueStatusMap["name"].(string), "", false)
+	if issueStatusLabel != nil {
+		labels = append(labels, issueStatusLabel)
 	}
 
 	// Handle Epic label
@@ -1037,6 +1079,25 @@ func (downloader *JiraDownloader) getIssueTypeLabel(issueTypeLabelName string, i
 	}
 }
 
+func (downloader *JiraDownloader) getIssueStatusLabel(issueStatusLabelName string, issueStatusDescription string, create bool) (*base.Label, bool) {
+	statusLabel, exists := downloader.issueStatusLabelsMap[issueStatusLabelName]
+	if !exists && create {
+		color := generateRandomColor(&[3]int{255, 255, 255})
+		statusLabel = &base.Label{
+			Name:        fmt.Sprintf("Status/%s", issueStatusLabelName),
+			Description: issueStatusDescription,
+			Color:       color,
+			Exclusive:   true,
+		}
+		downloader.issueStatusLabelsMap[issueStatusLabelName] = statusLabel
+		return statusLabel, true
+	} else if !exists {
+		return nil, false
+	} else {
+		return statusLabel, false
+	}
+}
+
 func (downloader *JiraDownloader) getEpicLabel(epicIssueKey string, epicName string, create bool) (*base.Label, bool) {
 	epicLabel, exists := downloader.epicLabelsMap[epicIssueKey]
 	if !exists && create {
@@ -1092,7 +1153,8 @@ func multipleReplace(text string, fileMappings map[string]string, jiraProject st
 	t = regexp.MustCompile(`\[~([a-z]+)\]`).ReplaceAllString(t, "@$1")                       // Links to users
 	t = regexp.MustCompile(`\[([^|\]]*)\]`).ReplaceAllString(t, "$1")                        // Links without alt
 	t = regexp.MustCompile(`\[(?:(.+)\|)([a-z]+://.+)\]`).ReplaceAllString(t, "[$1]($2)")
-	t = regexp.MustCompile(`(\b`+jiraProject+`-\d+\b)`).ReplaceAllString(t, "[$1]("+jiraUrl+"browse/$1)")
+
+	t = replaceIssueReferences(t, jiraProject) // Issue references
 	t = regexp.MustCompile(`\n *\# `).ReplaceAllString(t, "\n 1. ")
 	t = regexp.MustCompile(`\n *[\*\-\#]\# `).ReplaceAllString(t, "\n   1. ")
 	t = regexp.MustCompile(`\n *[\*\-\#]{2}\# `).ReplaceAllString(t, "\n     1. ")
@@ -1149,6 +1211,34 @@ func multipleReplace(text string, fileMappings map[string]string, jiraProject st
 	}
 
 	return t
+}
+
+func isBoundary(char rune) bool {
+	return (unicode.IsSpace(char) || unicode.IsPunct(char) || char == '\n') && char != '-' && char != '/'
+}
+
+func replaceIssueReferences(input string, projectName string) string {
+	re := regexp.MustCompile(projectName + `-(\d+)`)
+	matches := re.FindAllStringSubmatchIndex(input, -1)
+
+	var result strings.Builder
+	lastIndex := 0
+
+	for _, match := range matches {
+		start, end := match[0], match[1]
+		number := match[2:4]
+
+		// Ensure AVIX-1234 is standalone
+		if (start == 0 || isBoundary(rune(input[start-1]))) && (end == len(input) || isBoundary(rune(input[end]))) {
+			result.WriteString(input[lastIndex:start])
+			result.WriteString("#")
+			result.WriteString(input[number[0]:number[1]])
+			lastIndex = end
+		}
+	}
+
+	result.WriteString(input[lastIndex:])
+	return result.String()
 }
 
 func generateRandomColor(mix *[3]int) string {
